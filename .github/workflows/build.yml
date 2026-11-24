@@ -1,0 +1,91 @@
+# Builds omp-crowd.dll on every push and pull request (the package is the run's artifact).
+# A tag v<version> (dllmain.cpp's version; v0.7.0-beta.1 makes a pre-release) also
+# publishes the release: the zip, the DLL, the ini and SHA256SUMS.txt.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:bookworm   # the same image build.sh uses
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends g++-mingw-w64-i686 zip git ca-certificates >/dev/null
+          i686-w64-mingw32-g++ --version | head -1
+
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        run: |
+          v=$(grep -oE 'omp-crowd [0-9]+\.[0-9]+\.[0-9]+' dllmain.cpp | head -1 | cut -d' ' -f2)
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            t="${GITHUB_REF_NAME#v}"; t="${t%%-*}"
+            if [ "$t" != "$v" ]; then echo "::error::The tag is $GITHUB_REF_NAME but dllmain.cpp says $v."; exit 1; fi
+          fi
+          echo "omp-crowd $v"
+
+      - name: Compile
+        run: bash scripts/compile.sh
+
+      - name: Package
+        run: bash scripts/package.sh "${{ steps.ver.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omp-crowd-${{ steps.ver.outputs.version }}
+          path: |
+            build/omp-crowd.dll
+            build/omp-crowd.ini
+            build/omp-crowd-*.zip
+            build/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          ls -l out
+          sed "s/@VERSION@/$VERSION/g" dist/RELEASE.md > notes.md
+          prev=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          { echo; echo "### Changes${prev:+ since $prev}"; git log --no-merges --pretty='- %s' ${prev:+$prev..}"$TAG"; } >> notes.md
+          pre=""; case "$TAG" in *-*) pre="--prerelease";; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" out/* --title "omp-crowd $VERSION" --notes-file notes.md $pre
+          fi
